@@ -1,0 +1,17 @@
+{
+  "rows": 64,
+  "cols": 64,
+  "number_of_nodes": 4096,
+  "blocks_completed": 100000,
+  "total_samples": 892582,
+  "final_objective": 1.641886694660165e-08,
+  "strict_contraction_blocks": 100000,
+  "contracted_strict_blocks": 99228,
+  "contraction_failures": 772,
+  "zero_warm_gap_holds": 0,
+  "rho": 0.9999999,
+  "rho_endpoint": 0.45,
+  "maximum_horizon": 50,
+  "initial_state": 3669,
+  "final_state": 2821
+}
