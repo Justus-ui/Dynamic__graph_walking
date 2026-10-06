@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Block-to-block route-and-hold contraction on a 64 x 64 grid.
+Point-reference route-and-self-loop contraction with physical-time feedback.
 
-At block k, freeze the current first variation g_k = 2(eta_k - target).
-The reference error is the previous block measure p_k evaluated under g_k:
-
-    h_warm_k = <g_k, p_k> - min(g_k).
-
-The new block is constructed to satisfy
-
-    <g_k, p_{k+1}> - min(g_k) <= rho * h_warm_k.
-
-A destination is selected among vertices satisfying a stricter endpoint
-condition. A* minimizes physical travel plus accumulated excess oracle error.
-After reaching the destination, the discrete optimizer still constructs its
-block exactly as before. Only the physical realization changes: the route is
-executed once, then the exact stationary destination dwell required for the
-same frozen-gradient contraction is computed and executed with u = 0.
-
-Degenerate warm-gap case:
-If h_warm_k is numerically zero, strict multiplicative contraction is not
-meaningful. The script performs one self-loop "hold" sample. This changes the
-complete empirical measure and therefore the next first variation; it is the
-release-and-hold mechanism from the sketch.
+The empirical measure, objective, and gradient use exact residence time. The
+contraction reference is not the previous block measure: it is the Dirac
+occupation of the agent's current cell at the start of the iteration. A
+continuous-position A* planner uses actual first-order transition times and the
+source/target residence split as edge costs. After reaching the destination,
+the agent executes one stationary self-loop (u = 0) for the exact duration
+required to contract relative to the starting-cell point measure.
 """
 
 from __future__ import annotations
@@ -53,7 +40,7 @@ random_seed = 13
 
 # Destination must be strictly better than the final block threshold.
 # This slack pays for transit error.
-rho_endpoint = 0.5
+rho_endpoint = 0.9
 
 # Destination score:
 #   distance_weight * normalized graph distance
@@ -66,6 +53,13 @@ endpoint_weight = 2.0
 # + path_error_weight * normalized positive excess error.
 travel_edge_weight = 1.0
 path_error_weight = 4.0
+astar_heuristic_weight = 1.
+# Aggressive self-loop release rule.
+self_loop_near_min_fraction = 0.8
+self_loop_minimum_distance = 8
+long_block_warning_time = 5.0
+maximum_predicted_self_loop_time = 0.1
+route_improvement_tolerance = 1e-12
 
 objective_tolerance = 1e-15
 warm_gap_tolerance = 1e-12
@@ -79,7 +73,6 @@ entry_fraction = 0.02
 patrol_margin_fraction = 0.08
 cell_width = 1.0 / cols
 cell_height = 1.0 / rows
-
 
 
 # ==================================================
@@ -305,6 +298,18 @@ class BlockRecord:
     physical_patrol_time: float
     discrete_objective: float
     trajectory_objective: float
+    point_reference_error: float
+    required_self_loop_time: float
+    physical_contracted: bool
+    aggressive_self_loop: bool
+    planned_goal: int
+    current_to_goal_distance: int
+    current_error: float
+    goal_error: float
+    oracle_error_difference: float
+    objective_change: float
+    route_average_error: float
+    route_rejected_for_hold: bool
 
 
 def manhattan_distance(a: int, b: int) -> int:
@@ -367,55 +372,87 @@ def astar_variational_path(
     start: int,
     goal: int,
     g: np.ndarray,
+    position: np.ndarray,
+    speed: float,
 ) -> Tuple[List[int], float]:
-    """A* with travel plus accumulated positive excess over goal error."""
+    """A* using actual transition time and residence-weighted oracle error.
+
+    A state is (cell, incoming_cell). Its label stores the predicted continuous
+    entry position. For u -> v, the cost is
+
+        travel_edge_weight * (t_u + t_v)
+        + path_error_weight * [t_u (g[u]-g[goal])_+
+                               + t_v (g[v]-g[goal])_+] / scale.
+    """
     if start == goal:
         return [start], 0.0
+    if speed <= 0.0:
+        raise ValueError("speed must be positive")
 
     goal_value = float(g[goal])
     scale = max(float(np.max(g) - np.min(g)), 1e-15)
+    nominal_cell_time = min(cell_width, cell_height) / speed
 
-    def heuristic(node: int) -> float:
-        return travel_edge_weight * manhattan_distance(node, goal)
+    def heuristic(cell: int) -> float:
+        # Lower bound for the explicit nonnegative travel-time part.
+        return (
+            astar_heuristic_weight
+            * travel_edge_weight
+            * manhattan_distance(cell, goal)
+            * nominal_cell_time
+        )
 
-    best = np.full(number_of_nodes, np.inf)
-    predecessor = np.full(number_of_nodes, -1, dtype=np.int32)
-    closed = np.zeros(number_of_nodes, dtype=bool)
-    best[start] = 0.0
+    start_state = (int(start), -1)
+    best = {start_state: 0.0}
+    predecessor = {}
+    state_position = {start_state: np.asarray(position, dtype=float).copy()}
+    queue = [(heuristic(start), 0.0, start_state)]
+    goal_state = None
 
-    queue = [(heuristic(start), 0.0, start)]
     while queue:
-        _, cost, current = heapq.heappop(queue)
-        if closed[current]:
+        _, cost, state = heapq.heappop(queue)
+        current, _ = state
+        if cost > best.get(state, np.inf) + contraction_tolerance:
             continue
-        closed[current] = True
-
         if current == goal:
-            path = [goal]
-            cursor = goal
-            while cursor != start:
-                cursor = int(predecessor[cursor])
-                if cursor < 0:
-                    raise RuntimeError("Incomplete A* predecessor chain.")
-                path.append(cursor)
-            path.reverse()
-            return path, float(cost)
+            goal_state = state
+            break
 
         for nxt in neighbors[current]:
             if nxt == current:
                 continue
-            excess = max(0.0, float(g[nxt]) - goal_value)
-            step_cost = travel_edge_weight + path_error_weight * excess / scale
-            candidate = cost + step_cost
-            if candidate < best[nxt]:
-                best[nxt] = candidate
-                predecessor[nxt] = current
+            nxt = int(nxt)
+            next_state = (nxt, current)
+            next_position, source_time, target_time = transition_residence(
+                state_position[state], current, nxt, speed
+            )
+            transition_time = source_time + target_time
+            error_mass = (
+                source_time * max(0.0, float(g[current]) - goal_value)
+                + target_time * max(0.0, float(g[nxt]) - goal_value)
+            )
+            edge_cost = (
+                travel_edge_weight * transition_time
+                + path_error_weight * error_mass / scale
+            )
+            candidate = cost + edge_cost
+            if candidate < best.get(next_state, np.inf) - contraction_tolerance:
+                best[next_state] = candidate
+                predecessor[next_state] = state
+                state_position[next_state] = next_position
                 heapq.heappush(
                     queue,
-                    (candidate + heuristic(nxt), candidate, nxt),
+                    (candidate + heuristic(nxt), candidate, next_state),
                 )
 
-    raise RuntimeError(f"No path from {start} to {goal}.")
+    if goal_state is None:
+        raise RuntimeError(f"No path from {start} to {goal}.")
+
+    states = [goal_state]
+    while states[-1] != start_state:
+        states.append(predecessor[states[-1]])
+    states.reverse()
+    return [state[0] for state in states], float(best[goal_state])
 
 
 def build_block_to_block_contraction(
@@ -465,9 +502,24 @@ def run_algorithm(
     seed: int,
     initial_state: Optional[int],
     verbose_every: int,
+    near_min_fraction: float,
+    minimum_goal_distance: int,
+    long_block_time: float,
+    max_predicted_self_loop_time: float,
+    route_better_tolerance: float,
 ):
     if not (0.0 <= endpoint_rho < contraction_rho < 1.0):
         raise ValueError("Require 0 <= rho_endpoint < rho < 1.")
+    if not (0.0 <= near_min_fraction <= 1.0):
+        raise ValueError("near_min_fraction must lie in [0, 1].")
+    if minimum_goal_distance < 0:
+        raise ValueError("minimum_goal_distance must be nonnegative.")
+    if long_block_time <= 0.0:
+        raise ValueError("long_block_time must be positive.")
+    if max_predicted_self_loop_time <= 0.0:
+        raise ValueError("max_predicted_self_loop_time must be positive.")
+    if route_better_tolerance < 0.0:
+        raise ValueError("route_better_tolerance must be nonnegative.")
 
     rng = np.random.default_rng(seed)
     if initial_state is None:
@@ -488,16 +540,17 @@ def run_algorithm(
     physical_time_history = [physical_time]
     trajectory_objective_history = [objective(physical_occupation / physical_time)]
 
-    # Initial reference block is the initial one-sample occupation measure.
+    # No previous-block measure is used. The reference at each step is the
+    # Dirac occupation of the current/last-position cell.
     previous_block = [initial_state]
-    previous_block_measure = block_measure(previous_block)
+    previous_block_measure = None
 
     records: List[BlockRecord] = []
     sample_history = [total_samples]
-    objective_history = [objective(counts / total_samples)]
+    objective_history = [objective(physical_occupation / physical_time)]
 
     for block_index in range(blocks):
-        eta = counts / total_samples
+        eta = physical_occupation / physical_time
         objective_before = objective(eta)
         if objective_before <= objective_tolerance:
             break
@@ -505,24 +558,64 @@ def run_algorithm(
         g = first_variation(eta)
         s = float(np.min(g))
         history_gap = float(np.dot(g, eta) - s)
-        warm_gap = float(np.dot(g, previous_block_measure) - s)
-        warm_gap = max(0.0, warm_gap)
-
         if history_gap <= warm_gap_tolerance:
             break
 
-        if warm_gap <= warm_gap_tolerance:
-            # Hold step: strict contraction of zero is unavailable. The new
-            # sample changes eta and hence changes g at the next iteration.
+        # Point reference: the occupation of the current/last position cell.
+        # Its frozen-gradient error is simply g[current] - s.
+        point_reference_error = max(0.0, float(g[current] - s))
+        warm_gap = point_reference_error
+
+        minimizers = np.flatnonzero(
+            np.isclose(g, s, atol=contraction_tolerance, rtol=0.0)
+        )
+        if minimizers.size == 0:
+            minimizers = np.array([int(np.argmin(g))], dtype=np.int64)
+        minimizer_distances = np.asarray(
+            [manhattan_distance(current, int(node)) for node in minimizers],
+            dtype=np.int64,
+        )
+        nearest_pos = int(np.argmin(minimizer_distances))
+        nearest_minimizer = int(minimizers[nearest_pos])
+        nearest_minimizer_distance = int(minimizer_distances[nearest_pos])
+        near_minimum_threshold = near_min_fraction * max(
+            history_gap, warm_gap_tolerance
+        )
+        aggressive_self_loop = (
+            point_reference_error <= near_minimum_threshold + contraction_tolerance
+            and nearest_minimizer_distance >= minimum_goal_distance
+        )
+        start_cell = current
+        route_rejected_for_hold = False
+        route_average_error = point_reference_error
+
+        if aggressive_self_loop:
+            # The current point is already sufficiently good, while reaching a
+            # true minimizer would require a comparatively long route. Perform
+            # a stationary release self-loop and refresh the physical gradient.
+            planned_goal = nearest_minimizer
             destination = current
             path = [current]
             astar_cost = 0.0
-            block = [current]
-            new_block_error = float(g[current] - s)
-            contracted = new_block_error <= contraction_tolerance
-            travel_length = 0
-            holding_length = 1
-            mode = "hold_zero_warm_gap"
+            physical_route = []
+            physical_block_residence = np.zeros(number_of_nodes, dtype=float)
+            required_self_loop_time = self_loop_time
+            physical_travel_time = 0.0
+            dynamic_points = []
+            dynamic_current = current
+            mode = "aggressive_self_loop_near_minimum"
+        elif warm_gap <= warm_gap_tolerance:
+            planned_goal = current
+            destination = current
+            path = [current]
+            astar_cost = 0.0
+            physical_route = []
+            physical_block_residence = np.zeros(number_of_nodes, dtype=float)
+            required_self_loop_time = self_loop_time
+            physical_travel_time = 0.0
+            dynamic_points = []
+            dynamic_current = current
+            mode = "release_self_loop_zero_point_gap"
         else:
             choice = choose_destination(
                 current=current,
@@ -531,146 +624,176 @@ def run_algorithm(
                 endpoint_rho=endpoint_rho,
             )
             destination = choice.node
-            path, astar_cost = astar_variational_path(current, destination, g)
-            (
-                block,
-                new_block_error,
-                contracted,
-                travel_length,
-                holding_length,
-            ) = build_block_to_block_contraction(
-                path=path,
-                destination=destination,
-                g=g,
-                s=s,
-                warm_gap=warm_gap,
-                contraction_rho=contraction_rho,
-                horizon_cap=max_horizon,
+            planned_goal = destination
+            path, astar_cost = astar_variational_path(
+                current, destination, g, dynamic_position, u_max
             )
-            mode = "contract" if contracted else "horizon_truncated"
+            physical_route = list(path[1:])
+            if max_horizon is not None and len(physical_route) > max_horizon:
+                raise RuntimeError(
+                    "The physical A* path exceeds --max-horizon; truncating it "
+                    "would not reach the certified destination."
+                )
 
-        # --------------------------------------------------------------
-        # Physical realization only
-        # --------------------------------------------------------------
-        # The discrete optimizer, block, sample counts, and discrete contraction
-        # certificate above remain unchanged. Physically, execute the A* route
-        # once and replace all timer-quantized destination self-loops by one
-        # exact stationary dwell at the destination.
-        physical_route = list(path[1:])
-        if max_horizon is not None and len(physical_route) > max_horizon:
-            physical_route = physical_route[:max_horizon]
+            block_start_position = dynamic_position.copy()
+            if physical_route:
+                (
+                    dynamic_position,
+                    dynamic_current,
+                    dynamic_points,
+                    physical_block_residence,
+                    physical_travel_time,
+                    _unused_patrol_time,
+                ) = execute_block_online(
+                    dynamic_position,
+                    current,
+                    physical_route,
+                    u_max,
+                    self_loop_time,
+                    rng,
+                )
+            else:
+                dynamic_current = current
+                dynamic_points = []
+                physical_block_residence = np.zeros(number_of_nodes, dtype=float)
+                physical_travel_time = 0.0
 
-        if physical_route:
-            (
-                dynamic_position,
-                dynamic_current,
-                dynamic_points,
-                physical_block_residence,
-                physical_travel_time,
-                _unused_patrol_time,
-            ) = execute_block_online(
-                dynamic_position,
-                current,
-                physical_route,
-                u_max,
-                self_loop_time,
-                rng,
-            )
-        else:
-            dynamic_current = current
-            dynamic_points = []
-            physical_block_residence = np.zeros(number_of_nodes, dtype=float)
-            physical_travel_time = 0.0
+            if dynamic_current != destination:
+                raise RuntimeError("Physical route ended in the wrong cell.")
 
-        if dynamic_current != destination:
-            raise RuntimeError(
-                "Physical route did not reach the selected destination. "
-                "Increase --max-horizon or disable the horizon cap."
-            )
-
-        route_time = float(physical_block_residence.sum())
-
-        if warm_gap <= warm_gap_tolerance:
-            # The zero-warm-gap release mechanism is unchanged conceptually.
-            # Use one positive stationary dwell so the physical measure advances.
-            physical_hold_time = self_loop_time
-        else:
-            threshold = contraction_rho * warm_gap
+            route_time = float(physical_block_residence.sum())
+            threshold = contraction_rho * point_reference_error
             destination_error = float(g[destination] - s)
-            route_error_mass = float(
-                np.dot(g - s, physical_block_residence)
-            )
-            excess_error_mass = route_error_mass - threshold * route_time
+            route_error_mass = float(np.dot(g - s, physical_block_residence))
+            excess_mass = route_error_mass - threshold * route_time
 
-            if excess_error_mass <= contraction_tolerance:
-                physical_hold_time = 0.0
+            if excess_mass <= contraction_tolerance:
+                required_self_loop_time = 0.0
             else:
                 denominator = threshold - destination_error
                 if denominator <= contraction_tolerance:
                     raise RuntimeError(
-                        "No finite stationary destination dwell can satisfy the "
-                        "physical frozen-gradient contraction."
+                        "No finite destination self-loop can contract relative "
+                        "to the current-cell point reference."
                     )
-                physical_hold_time = excess_error_mass / denominator
-                # Protect the equality case against floating-point roundoff.
-                physical_hold_time *= 1.0 + 32.0 * np.finfo(float).eps
+                required_self_loop_time = excess_mass / denominator
+                required_self_loop_time *= 1.0 + 32.0 * np.finfo(float).eps
 
-            # If the route has zero duration, use a positive dwell. Any positive
-            # duration has the destination Dirac measure and therefore the same
-            # normalized block error.
             if route_time <= contraction_tolerance:
-                physical_hold_time = max(
-                    physical_hold_time,
-                    self_loop_time,
+                required_self_loop_time = max(
+                    required_self_loop_time, self_loop_time
                 )
 
-        # Stationary self-loop: u = 0. The continuous position is unchanged.
-        physical_block_residence[destination] += physical_hold_time
-        physical_patrol_time = physical_hold_time
-        physical_block_time = float(physical_block_residence.sum())
-
-        if physical_block_time <= contraction_tolerance:
-            raise RuntimeError("Dynamic block has zero physical duration.")
-
-        # Sanity-check the actually generated physical block, without feeding it
-        # back into the discrete optimizer.
-        physical_block_measure = (
-            physical_block_residence / physical_block_time
-        )
-        physical_block_error = float(
-            np.dot(g, physical_block_measure) - s
-        )
-        if (
-            warm_gap > warm_gap_tolerance
-            and physical_block_error
-            > contraction_rho * warm_gap + 10.0 * contraction_tolerance
-        ):
-            raise RuntimeError(
-                "Exact physical hold failed its contraction check: "
-                f"error={physical_block_error:.16e}, "
-                f"threshold={contraction_rho * warm_gap:.16e}."
+            route_average_error = (
+                route_error_mass / route_time
+                if route_time > contraction_tolerance
+                else destination_error
+            )
+            route_is_strictly_better = (
+                route_average_error
+                < point_reference_error - route_better_tolerance
+            )
+            route_rejected_for_hold = (
+                not route_is_strictly_better
+                or not np.isfinite(required_self_loop_time)
+                or required_self_loop_time
+                > max_predicted_self_loop_time + contraction_tolerance
             )
 
+            if route_rejected_for_hold:
+                # Reject the proposed route before it affects the physical
+                # trajectory. Stay at the current point for one short release
+                # self-loop, update eta, and recompute the gradient.
+                dynamic_position = block_start_position
+                dynamic_current = current
+                dynamic_points = []
+                physical_route = []
+                destination = current
+                physical_block_residence = np.zeros(
+                    number_of_nodes, dtype=float
+                )
+                physical_travel_time = 0.0
+                required_self_loop_time = min(
+                    self_loop_time, max_predicted_self_loop_time
+                )
+                aggressive_self_loop = True
+                mode = "release_self_loop_rejected_route"
+            else:
+                mode = "point_reference_contract"
+
+        # Execute the self-loop as a stationary dwell: u = 0.
+        physical_block_residence[destination] += required_self_loop_time
+        physical_patrol_time = required_self_loop_time
+        physical_block_time = float(physical_block_residence.sum())
+        if physical_block_time <= contraction_tolerance:
+            raise RuntimeError("Physical block has zero duration.")
+
+        new_block_measure = physical_block_residence / physical_block_time
+        new_block_error = float(np.dot(g, new_block_measure) - s)
+        physical_contracted = (
+            new_block_error
+            <= contraction_rho * point_reference_error + contraction_tolerance
+            if point_reference_error > warm_gap_tolerance
+            else new_block_error <= contraction_tolerance
+        )
+        if (
+            point_reference_error > warm_gap_tolerance
+            and not physical_contracted
+            and not aggressive_self_loop
+        ):
+            raise RuntimeError(
+                "Point-reference physical contraction failed: "
+                f"error={new_block_error:.16e}, "
+                f"threshold={contraction_rho * point_reference_error:.16e}."
+            )
+
+        # Update the optimizer itself with actual physical residence time.
         physical_occupation += physical_block_residence
         physical_time += physical_block_time
         dynamic_trajectory.extend(dynamic_points)
-        trajectory_objective_after = objective(
-            physical_occupation / physical_time
-        )
+        eta_after = physical_occupation / physical_time
+        objective_after = objective(eta_after)
+        trajectory_objective_after = objective_after
+        objective_change = objective_after - objective_before
+        current_to_goal_distance = manhattan_distance(start_cell, planned_goal)
+        current_error = float(g[start_cell] - s)
+        goal_error = float(g[planned_goal] - s)
+        oracle_error_difference = current_error - goal_error
 
+        if physical_block_time > long_block_time:
+            print(
+                "LONG BLOCK "
+                f"block={block_index + 1} "
+                f"time={physical_block_time:.6f}s "
+                f"route_time={physical_travel_time:.6f}s "
+                f"self_loop={required_self_loop_time:.6f}s "
+                f"distance={current_to_goal_distance} "
+                f"current_error={current_error:.6e} "
+                f"goal_error={goal_error:.6e} "
+                f"oracle_difference={oracle_error_difference:.6e} "
+                f"route_average_error={route_average_error:.6e} "
+                f"objective_change={objective_change:+.6e} "
+                f"mode={mode}",
+                flush=True,
+            )
+
+        # Retain a compact discrete path only as a diagnostic output.
+        block = list(physical_route) + [destination]
         nodes = np.asarray(block, dtype=np.int64)
         np.add.at(counts, nodes, 1)
         trajectory.extend(block)
         total_samples += len(block)
-        current = int(block[-1])
-
-        new_block_measure = block_measure(block)
-        eta_after = counts / total_samples
-        objective_after = objective(eta_after)
-        gamma = len(block) / total_samples
+        current = destination
+        travel_length = len(physical_route)
+        holding_length = 1 if required_self_loop_time > 0.0 else 0
+        contracted = physical_contracted
+        gamma = physical_block_time / physical_time
         contraction_ratio = (
-            new_block_error / warm_gap if warm_gap > warm_gap_tolerance else np.nan
+            new_block_error / point_reference_error
+            if point_reference_error > warm_gap_tolerance
+            else np.nan
         )
+
         row, col = node_coordinates(destination)
 
         records.append(
@@ -697,28 +820,49 @@ def run_algorithm(
                 physical_block_time=physical_block_time,
                 physical_travel_time=physical_travel_time,
                 physical_patrol_time=physical_patrol_time,
-                discrete_objective=objective_after,
+                discrete_objective=objective(counts / total_samples),
                 trajectory_objective=trajectory_objective_after,
+                point_reference_error=point_reference_error,
+                required_self_loop_time=required_self_loop_time,
+                physical_contracted=physical_contracted,
+                aggressive_self_loop=aggressive_self_loop,
+                planned_goal=planned_goal,
+                current_to_goal_distance=current_to_goal_distance,
+                current_error=current_error,
+                goal_error=goal_error,
+                oracle_error_difference=oracle_error_difference,
+                objective_change=objective_change,
+                route_average_error=route_average_error,
+                route_rejected_for_hold=route_rejected_for_hold,
             )
         )
 
         previous_block = block
-        previous_block_measure = new_block_measure
+        # The next reference is again the Dirac mass of the new current cell,
+        # not this complete block measure.
+        previous_block_measure = None
         sample_history.append(total_samples)
         objective_history.append(objective_after)
         physical_time_history.append(physical_time)
         trajectory_objective_history.append(trajectory_objective_after)
 
         if verbose_every > 0 and (block_index + 1) % verbose_every == 0:
-            failures = sum(not r.contracted for r in records if r.mode != "hold_zero_warm_gap")
-            holds = sum(r.mode == "hold_zero_warm_gap" for r in records)
+            strict_so_far = [
+                r for r in records
+                if not r.aggressive_self_loop
+                and "zero_point_gap" not in r.mode
+            ]
+            failures = sum(not r.contracted for r in strict_so_far)
+            holds = sum("zero_point_gap" in r.mode for r in records)
+            aggressive_releases = sum(r.aggressive_self_loop for r in records)
             print(
                 f"block={block_index + 1:7d} "
                 f"T={physical_time:12.6f} "
-                f"G_discrete={objective_after:.6e} "
-                f"G_trajectory={trajectory_objective_after:.6e} "
+                f"G_physical={objective_after:.6e} "
+                f"G_count={objective(counts / total_samples):.6e} "
                 f"N={len(block):4d} ratio={contraction_ratio!s:>10} "
-                f"holds={holds} failures={failures}"
+                f"holds={holds} aggressive_releases={aggressive_releases} "
+                f"failures={failures}"
             )
 
     return (
@@ -821,11 +965,51 @@ def parse_arguments():
     parser.add_argument("--rho", type=float, default=rho)
     parser.add_argument("--rho-endpoint", type=float, default=rho_endpoint)
     parser.add_argument("--seed", type=int, default=random_seed)
+    parser.add_argument(
+        "--self-loop-near-min-fraction",
+        type=float,
+        default=self_loop_near_min_fraction,
+        help=(
+            "Use an immediate stationary self-loop when current_error is at most "
+            "this fraction of the global history gap and the nearest minimizer "
+            "is sufficiently far away."
+        ),
+    )
+    parser.add_argument(
+        "--self-loop-min-distance",
+        type=int,
+        default=self_loop_minimum_distance,
+        help="Minimum Manhattan distance to the nearest minimizer for aggressive self-loop release.",
+    )
+    parser.add_argument(
+        "--long-block-warning-time",
+        type=float,
+        default=long_block_warning_time,
+        help="Print detailed diagnostics for blocks longer than this many seconds.",
+    )
+    parser.add_argument(
+        "--max-predicted-self-loop-time",
+        type=float,
+        default=maximum_predicted_self_loop_time,
+        help=(
+            "Reject a proposed route before execution when its predicted "
+            "destination self-loop exceeds this duration."
+        ),
+    )
+    parser.add_argument(
+        "--route-improvement-tolerance",
+        type=float,
+        default=route_improvement_tolerance,
+        help=(
+            "A route is accepted only if its average frozen-gradient error is "
+            "below the current-point error by at least this tolerance."
+        ),
+    )
     parser.add_argument("--initial-state", type=int, default=None)
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("waypoint_block_to_block_discrete_exact_physical_hold_output"),
+        default=Path("waypoint_point_reference_physical_astar_output"),
     )
     parser.add_argument("--verbose-every", type=int, default=500)
     return parser.parse_args()
@@ -857,6 +1041,11 @@ def main():
         seed=args.seed,
         initial_state=args.initial_state,
         verbose_every=args.verbose_every,
+        near_min_fraction=args.self_loop_near_min_fraction,
+        minimum_goal_distance=args.self_loop_min_distance,
+        long_block_time=args.long_block_warning_time,
+        max_predicted_self_loop_time=args.max_predicted_self_loop_time,
+        route_better_tolerance=args.route_improvement_tolerance,
     )
 
     save_records(records, args.output_dir / "block_history.csv")
@@ -900,20 +1089,34 @@ def main():
     fig.savefig(args.output_dir / "online_dynamic_trajectory.png", dpi=200)
     plt.close(fig)
 
-    strict_records = [r for r in records if r.mode != "hold_zero_warm_gap"]
+    strict_records = [
+        r for r in records
+        if not r.aggressive_self_loop
+        and "zero_point_gap" not in r.mode
+    ]
     summary = {
         "rows": rows,
         "cols": cols,
         "number_of_nodes": number_of_nodes,
         "blocks_completed": len(records),
         "total_samples": len(trajectory),
-        "final_objective": objective(final_eta),
+        "final_objective": objective(final_trajectory_eta),
         "final_discrete_objective": objective(final_eta),
         "final_trajectory_objective": objective(final_trajectory_eta),
         "physical_time": float(physical_time_history[-1]),
-        "optimizer": "fully discrete block-to-block",
-        "physical_execution": "route plus exact stationary destination dwell",
-        "dynamic_feedback": False,
+        "optimizer": "physical-time point-reference route-and-self-loop",
+        "physical_execution": "actual-time A* route plus stationary destination self-loop",
+        "contraction_reference": "Dirac occupation of current/last-position cell",
+        "dynamic_feedback": True,
+        "empirical_measure": "normalized exact physical residence time",
+        "self_loop_near_min_fraction": args.self_loop_near_min_fraction,
+        "self_loop_minimum_distance": args.self_loop_min_distance,
+        "long_block_warning_time": args.long_block_warning_time,
+        "maximum_predicted_self_loop_time": args.max_predicted_self_loop_time,
+        "route_improvement_tolerance": args.route_improvement_tolerance,
+        "routes_rejected_for_hold": int(sum(r.route_rejected_for_hold for r in records)),
+        "aggressive_self_loop_releases": int(sum(r.aggressive_self_loop for r in records)),
+        "long_blocks": int(sum(r.physical_block_time > args.long_block_warning_time for r in records)),
         "strict_contraction_blocks": len(strict_records),
         "contracted_strict_blocks": sum(r.contracted for r in strict_records),
         "contraction_failures": sum(not r.contracted for r in strict_records),
