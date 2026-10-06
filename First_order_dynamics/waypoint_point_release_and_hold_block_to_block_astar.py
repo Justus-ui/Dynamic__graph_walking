@@ -55,8 +55,8 @@ travel_edge_weight = 1.0
 path_error_weight = 4.0
 astar_heuristic_weight = 1.
 # Aggressive self-loop release rule.
-self_loop_near_min_fraction = 0.8
-self_loop_minimum_distance = 8
+self_loop_near_min_fraction = 0.35 ## Condition for aggressive self-loop: point-reference error <= fraction * warm_gap
+self_loop_minimum_distance = 15 ## Condition for aggressive self-loop: nearest minimizer distance >= minimum_distance
 long_block_warning_time = 5.0
 maximum_predicted_self_loop_time = 0.1
 route_improvement_tolerance = 1e-12
